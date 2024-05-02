@@ -22,6 +22,8 @@
 
 #include <aie_api/aie.hpp>
 
+#include "zero.cc"
+
 template <typename T_in, typename T_out, unsigned rowA, unsigned colA,
           unsigned colB, unsigned r, unsigned s, unsigned t>
 void matmul_vectorized(const T_in *__restrict pA, unsigned offsetA,
@@ -273,6 +275,17 @@ extern "C" {
         64, 64, 64>(a_in, offsetA, b_in, offsetB, c_out, offsetC);             \
   }
 
-combos(matmul_vectorized_c_func)
+#define matmul_zero_filling_vectorized_c_func(ctype_in, mlir_type_in,          \
+                                              ctype_out, mlir_type_out, r,     \
+                                              s, t)                            \
+  void matmul_zero_filling_##mlir_type_in##_##mlir_type_out(                   \
+      ctype_in *a_in, unsigned offsetA, ctype_in *b_in, unsigned offsetB,      \
+      ctype_out *c_out, unsigned offsetC) {                                    \
+    zero_vectorized<ctype_out, 64, 64, 32>(c_out, offsetC);                    \
+    matmul_vectorized_##r##x##s##x##t##_##mlir_type_in##_##mlir_type_out<      \
+        64, 64, 64>(a_in, offsetA, b_in, offsetB, c_out, offsetC);             \
+  }
+
+combos(matmul_vectorized_c_func) combos(matmul_zero_filling_vectorized_c_func)
 
 } // extern "C"
