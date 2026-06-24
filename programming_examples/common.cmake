@@ -48,8 +48,33 @@ if(NOT MLIR_AIE_DIR)
 endif()
 
 # -----------------------------------------------------------------------------
+# HRX backend selection (RUNTIME=hrx in makefile-common -> -DUSE_HRX=ON)
+# -----------------------------------------------------------------------------
+# When building the HRX host backend, examples dispatch through libhrx instead
+# of XRT. We don't need the XRT SDK headers at all, but the per-example
+# CMakeLists still does `target_link_libraries(... xrt_coreutil)` and
+# `target_include_directories(... ${XRT_INC_DIR})`. To keep those a no-op
+# without editing ~50 example files, define a dummy INTERFACE target named
+# `xrt_coreutil` (so the link resolves to nothing instead of `-lxrt_coreutil`)
+# and leave the XRT include/lib dir variables empty.
+option(USE_HRX "Build programming-example host code against HRX instead of XRT" OFF)
+
+if(USE_HRX)
+  if(NOT TARGET xrt_coreutil)
+    add_library(xrt_coreutil INTERFACE IMPORTED)
+  endif()
+  if(NOT DEFINED XRT_INC_DIR)
+    set(XRT_INC_DIR "" CACHE STRING "Path to XRT headers (unused for HRX)")
+  endif()
+  if(NOT DEFINED XRT_LIB_DIR)
+    set(XRT_LIB_DIR "" CACHE STRING "Path to XRT libraries (unused for HRX)")
+  endif()
+endif()
+
+# -----------------------------------------------------------------------------
 # XRT auto-detection (supports both Ubuntu packages and legacy /opt/xilinx/xrt)
 # -----------------------------------------------------------------------------
+if(NOT USE_HRX)
 if(NOT DEFINED XRT_INC_DIR OR NOT DEFINED XRT_LIB_DIR)
     find_package(XRT QUIET)
     if(XRT_FOUND)
@@ -91,6 +116,7 @@ if(NOT DEFINED XRT_INC_DIR OR NOT DEFINED XRT_LIB_DIR)
         endif()
     endif()
 endif()
+endif() # NOT USE_HRX
 
 # -----------------------------------------------------------------------------
 # test_utils discovery
@@ -103,6 +129,53 @@ set(TEST_UTILS_RUNTIME_LIB_DIR "${MLIR_AIE_DIR}/runtime_lib")
 
 function(target_link_test_utils target_name)
   target_include_directories(${target_name} PUBLIC "${TEST_UTILS_RUNTIME_LIB_DIR}")
+
+  # 0) HRX backend: dispatch via libhrx, no XRT SDK needed. test_utils is built
+  #    WITHOUT TEST_UTILS_USE_XRT (its XRT block is #ifdef'd out and unused by
+  #    the HRX wrapper), and the example target gets TEST_UTILS_USE_HRX so
+  #    xrt_test_wrapper.h pulls in hrx_test_wrapper.h.
+  if(USE_HRX)
+    if(NOT EXISTS "${TEST_UTILS_SRC_DIR}/hrx_test_wrapper.h")
+      message(FATAL_ERROR "HRX wrapper not found at: ${TEST_UTILS_SRC_DIR}")
+    endif()
+
+    # HRX paths (from activate_env.sh): HRX_DIR (headers), LIBHRX_DIR (libhrx.so).
+    set(_hrx_dir "$ENV{HRX_DIR}")
+    set(_libhrx_dir "$ENV{LIBHRX_DIR}")
+    if(NOT _hrx_dir OR NOT EXISTS "${_hrx_dir}/libhrx/include/hrx_runtime.h")
+      message(FATAL_ERROR "USE_HRX set but HRX_DIR/libhrx/include/hrx_runtime.h "
+        "not found (HRX_DIR='${_hrx_dir}'). Source activate_env.sh.")
+    endif()
+    if(NOT _libhrx_dir OR NOT EXISTS "${_libhrx_dir}/libhrx.so")
+      message(FATAL_ERROR "USE_HRX set but ${_libhrx_dir}/libhrx.so not found. "
+        "Source activate_env.sh (sets LIBHRX_DIR).")
+    endif()
+
+    # XADX builder helper: env override, else the in-tree prebuilt .so.
+    set(_xadx_so "$ENV{IRON_HRX_XADX}")
+    if(NOT _xadx_so)
+      set(_xadx_so "${MLIR_AIE_DIR}/python/utils/hostruntime/hrxruntime/libironhrx_xadx.so")
+    endif()
+    if(NOT EXISTS "${_xadx_so}")
+      message(FATAL_ERROR "libironhrx_xadx.so not found at '${_xadx_so}'. "
+        "Build it with python/utils/hostruntime/hrxruntime/build_xadx_helper.sh "
+        "or set IRON_HRX_XADX.")
+    endif()
+
+    target_include_directories(${target_name} PUBLIC
+        "${TEST_UTILS_SRC_DIR}" "${_hrx_dir}/libhrx/include")
+    target_compile_definitions(${target_name} PRIVATE TEST_UTILS_USE_HRX)
+
+    if(NOT TARGET test_utils)
+      add_library(test_utils STATIC "${TEST_UTILS_SRC_DIR}/test_utils.cpp")
+      target_include_directories(test_utils PUBLIC
+          "${TEST_UTILS_SRC_DIR}" "${TEST_UTILS_RUNTIME_LIB_DIR}")
+    endif()
+
+    target_link_libraries(${target_name} PUBLIC
+        test_utils "${_libhrx_dir}/libhrx.so" "${_xadx_so}")
+    return()
+  endif()
 
   # 1) Use installed/prebuilt if present
   if(EXISTS "${TEST_UTILS_INST_INC_DIR}/xrt_test_wrapper.h" AND EXISTS "${TEST_UTILS_INST_LIB_DIR}")

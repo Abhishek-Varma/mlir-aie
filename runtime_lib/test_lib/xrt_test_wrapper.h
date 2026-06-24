@@ -1,3 +1,10 @@
+// When built for the HRX backend (RUNTIME=hrx / -DUSE_HRX=ON), this header
+// becomes a thin shim that pulls in the HRX drop-in instead of the XRT impl, so
+// example test.cpp files keep `#include "xrt_test_wrapper.h"` unchanged.
+#ifdef TEST_UTILS_USE_HRX
+#include "hrx_test_wrapper.h"
+#else
+
 #include "cxxopts.hpp"
 #include "test_utils.h"
 
@@ -501,3 +508,5 @@ int setup_and_run_aie(int IN1_VOLUME, int OUT_VOLUME, struct args myargs,
     return 1;
   }
 }
+
+#endif // TEST_UTILS_USE_HRX
