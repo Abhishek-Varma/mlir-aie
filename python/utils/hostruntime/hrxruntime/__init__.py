@@ -21,6 +21,8 @@ import ctypes
 import os
 from pathlib import Path
 
+from .discovery import ensure_xadx_helper, find_libhrx
+
 # ---------------------------------------------------------------------------
 # Enum / flag constants (mirror hrx_runtime.h; values match IREE HAL).
 # ---------------------------------------------------------------------------
@@ -67,20 +69,9 @@ class HrxBufferRef(ctypes.Structure):
 def _load_libhrx() -> ctypes.CDLL:
     last_err = None
     tried = []
-    for c in [
-        os.environ.get("HRX_LIBHRX"),
-        (os.path.join(os.environ["LIBHRX_DIR"], "libhrx.so"))
-        if os.environ.get("LIBHRX_DIR")
-        else None,
-        (
-            os.path.join(
-                os.environ["HRX_BUILD"], "libhrx", "src", "libhrx", "libhrx.so"
-            )
-        )
-        if os.environ.get("HRX_BUILD")
-        else None,
-        "libhrx.so",
-    ]:
+    # Auto-detected path first (env hints + standard locations), then a bare
+    # name so the dynamic loader's LD_LIBRARY_PATH search still works.
+    for c in [find_libhrx(), "libhrx.so"]:
         if not c:
             continue
         tried.append(c)
@@ -90,18 +81,15 @@ def _load_libhrx() -> ctypes.CDLL:
             last_err = e
     raise HRXError(
         f"Could not load libhrx.so (tried: {tried}). "
-        f"Set HRX_BUILD/LIBHRX_DIR or add libhrx to LD_LIBRARY_PATH. "
-        f"Last error: {last_err}"
+        f"Install HRX to a standard location, set HRX_DIR/LIBHRX_DIR, or add "
+        f"libhrx to LD_LIBRARY_PATH. Last error: {last_err}"
     )
 
 
 def _load_xadx_helper() -> ctypes.CDLL:
-    here = Path(__file__).resolve().parent
-    candidates = [
-        os.environ.get("IRON_HRX_XADX"),
-        str(here / "libironhrx_xadx.so"),
-        "libironhrx_xadx.so",
-    ]
+    # Auto-detect a prebuilt helper; if absent, build it on first use from the
+    # detected HRX tree (no manual step). Falls back to the loader search path.
+    candidates = [ensure_xadx_helper(), "libironhrx_xadx.so"]
     last_err = None
     tried = []
     for c in candidates:
@@ -114,7 +102,9 @@ def _load_xadx_helper() -> ctypes.CDLL:
             last_err = e
     raise HRXError(
         f"Could not load libironhrx_xadx.so (tried: {tried}). "
-        f"Build it with build_xadx_helper.sh. Last error: {last_err}"
+        f"It is built on first use from the HRX tree; ensure HRX_DIR/HRX_BUILD "
+        f"point at a full HRX checkout + build, or run build_xadx_helper.sh. "
+        f"Last error: {last_err}"
     )
 
 

@@ -37,18 +37,57 @@ except ImportError as e:
     )
     has_xrt = False
 
-# Host-runtime backend selection. ``IRON_RUNTIME`` chooses between the XRT
-# (default) and HRX (libhrx amdxdna) host stacks. The HRX backend consumes the
-# identical aiecc artifacts (final.xclbin + insts.bin); only the dispatch path
-# differs. We import the HRX package lazily (only when selected) because it
-# dlopen()s libhrx + libironhrx_xadx at import time.
-_IRON_RUNTIME = os.environ.get("IRON_RUNTIME", "xrt").lower()
+# Capability probe for the HRX (libhrx amdxdna) backend. This is the analogue of
+# ``import pyxrt`` above for XRT: it only checks whether libhrx.so can be located
+# on this host (no dlopen / no device init), so it is cheap and safe to run at
+# import time even when HRX is not the selected backend.
+try:
+    from .hostruntime.hrxruntime.discovery import hrx_available
+
+    has_hrx = hrx_available()
+except Exception as e:  # discovery must never break the import of aie.utils
+    _logger.debug("HRX discovery probe failed: %s", e)
+    has_hrx = False
+
+# Host-runtime backend selection. ``IRON_RUNTIME`` chooses between the XRT and
+# HRX host stacks; both consume the identical aiecc artifacts (final.xclbin +
+# insts.bin) and only the dispatch path differs. Accepted values:
+#   xrt   - force the XRT backend (error later if pyxrt is missing).
+#   hrx   - force the HRX backend (error here if libhrx is not found).
+#   auto  - (default) prefer XRT when present, else fall back to HRX, else CPU.
+# We import the selected backend lazily because the HRX package dlopen()s libhrx
+# + libironhrx_xadx at import time.
+_IRON_RUNTIME = os.environ.get("IRON_RUNTIME", "auto").lower()
+
+if _IRON_RUNTIME not in ("xrt", "hrx", "auto"):
+    _logger.warning(
+        "Unknown IRON_RUNTIME=%r; expected one of xrt|hrx|auto. Using 'auto'.",
+        _IRON_RUNTIME,
+    )
+    _IRON_RUNTIME = "auto"
+
+if _IRON_RUNTIME == "hrx" and not has_hrx:
+    raise ImportError(
+        "IRON_RUNTIME=hrx was requested but libhrx.so could not be located. "
+        "Install HRX to a standard location, or set HRX_DIR/LIBHRX_DIR. "
+        "Use IRON_RUNTIME=auto to fall back to XRT/CPU when HRX is absent."
+    )
+
+# Resolve 'auto' to a concrete backend with graceful degradation.
+if _IRON_RUNTIME == "auto":
+    if has_xrt:
+        _IRON_RUNTIME = "xrt"
+    elif has_hrx:
+        _IRON_RUNTIME = "hrx"
+        _logger.info("IRON_RUNTIME=auto: XRT unavailable, using HRX backend.")
+    else:
+        _IRON_RUNTIME = "cpu"
 
 if _IRON_RUNTIME == "hrx":
     from .hostruntime.hrxruntime.tensor import HRXTensor
 
     DEFAULT_TENSOR_CLASS = HRXTensor
-elif has_xrt:
+elif _IRON_RUNTIME == "xrt" and has_xrt:
     from .hostruntime.xrtruntime.tensor import XRTTensor
 
     DEFAULT_TENSOR_CLASS = XRTTensor
@@ -231,7 +270,7 @@ def _get_default_npu_runtime():
         from .hostruntime.hrxruntime.hostruntime import CachedHRXRuntime
 
         _DefaultNPURuntime = CachedHRXRuntime()
-    elif has_xrt:
+    elif _IRON_RUNTIME == "xrt" and has_xrt:
         assert CachedXRTRuntime is not None
         _DefaultNPURuntime = CachedXRTRuntime()
     return _DefaultNPURuntime
