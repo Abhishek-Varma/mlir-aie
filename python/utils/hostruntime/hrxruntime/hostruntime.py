@@ -133,6 +133,31 @@ class HRXHostRuntime(HostRuntime):
 
         return HRXKernelHandle(exe, ordv, kernel_name, xclbin_path, insts_path)
 
+    def _prepare_bindings(self, args):
+        """Validate/sync a run's args and return its HRX dispatch bindings.
+
+        Drops callables (the ``@iron.jit`` trailing kernel ref), checks every
+        remaining arg is an ``HRXTensor``, pushes host-side inputs to the device
+        (a cheap ``flush_range`` clflush on the persistent mapping — no copy),
+        and returns both the kept tensors and the ``(buffer, size)`` bindings.
+
+        Flushing every binding (not just inputs) is safe: an output is about to
+        be overwritten on-device, and in a chain a flush of an intermediate
+        buffer happens at record time, before any device work, so an earlier
+        run's device writes still win.
+        """
+        kept = [a for a in args if not callable(a)]
+        if not all(isinstance(a, self._tensor_class) for a in kept):
+            raise HostRuntimeError(
+                f"The {self.__class__.__name__} can only take "
+                f"{self._tensor_class.__name__} as arguments, but got: {kept}"
+            )
+        for a in kept:
+            a.to("npu")
+            a._sync_to_device()
+        bindings = [(a.buffer_object(), a.nbytes_alloc()) for a in kept]
+        return kept, bindings
+
     def run(
         self,
         kernel_handle: KernelHandle,
@@ -145,22 +170,7 @@ class HRXHostRuntime(HostRuntime):
         assert isinstance(kernel_handle, HRXKernelHandle)
         self.check_device_consistency()
 
-        args = [a for a in args if not callable(a)]
-        if not all(isinstance(a, self._tensor_class) for a in args):
-            raise HostRuntimeError(
-                f"The {self.__class__.__name__} can only take "
-                f"{self._tensor_class.__name__} as arguments, but got: {args}"
-            )
-
-        # Push host-side inputs to the device. flush_range is a cheap clflush on
-        # the persistent mapping (no copy); doing it for every binding is safe
-        # (outputs are about to be overwritten) and guarantees correctness even
-        # when callers mutate tensor .data in place without going through to().
-        for a in args:
-            a.to("npu")
-            a._sync_to_device()
-
-        bindings = [(a.buffer_object(), a.nbytes_alloc()) for a in args]
+        args, bindings = self._prepare_bindings(args)
 
         start = time.time_ns()
         try:
@@ -179,6 +189,62 @@ class HRXHostRuntime(HostRuntime):
         # Leave the tensors marked device="npu" so the next host read
         # (numpy()/to("cpu")) invalidates the cache via _sync_from_device.
         for a in args:
+            a.device = "npu"
+
+        return HRXKernelResult(stop - start, success=True)
+
+    def run_chain(
+        self, runs, fail_on_error: bool = True
+    ) -> HRXKernelResult:
+        """Execute a chain (runlist) of dispatches as a single batched submit.
+
+        This is the HRX equivalent of ``xrt::runlist`` (see the XRT
+        ``test_runlist.cpp`` testbench): ``runs`` is a sequence of
+        ``(kernel_handle, args)`` entries that are recorded, in order, into one
+        HRX command buffer with an execution + memory barrier between them, then
+        submitted with a single ``synchronize``. Because of the barrier, a later
+        run observes an earlier run's device writes, so producer -> consumer
+        chains work (e.g. ``run0`` writes ``out0`` and ``run1`` reads ``out0``).
+        The amdxdna HAL lowers the multi-dispatch command buffer into one
+        ``ERT_CMD_CHAIN`` issued/waited once.
+
+        All entries may share one ``kernel_handle`` (re-dispatching the same
+        executable with different bindings) or use different handles (a true
+        multi-kernel pipeline). Returns one :class:`HRXKernelResult` covering the
+        whole chain.
+        """
+        self.check_device_consistency()
+        runs = list(runs)
+        if not runs:
+            return HRXKernelResult(0, success=True)
+
+        # Record everything first: all host->device flushes happen here, before
+        # any device execution, so flushing an intermediate buffer that an
+        # earlier run overwrites on-device is harmless.
+        items = []
+        touched = []
+        for kernel_handle, args in runs:
+            assert isinstance(kernel_handle, HRXKernelHandle)
+            kept, bindings = self._prepare_bindings(args)
+            items.append(
+                (kernel_handle.executable, kernel_handle.export_ordinal, bindings)
+            )
+            touched.extend(kept)
+
+        start = time.time_ns()
+        try:
+            self._ctx.dispatch_chain(items)
+            self._ctx.synchronize()
+        except HRXError as e:
+            if fail_on_error:
+                raise HostRuntimeError(f"HRX chain dispatch failed: {e}") from e
+            stop = time.time_ns()
+            return HRXKernelResult(stop - start, success=False)
+        stop = time.time_ns()
+
+        # Mark every touched tensor device-resident so the next host read
+        # invalidates and observes the on-device results.
+        for a in touched:
             a.device = "npu"
 
         return HRXKernelResult(stop - start, success=True)

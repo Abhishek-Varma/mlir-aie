@@ -529,6 +529,51 @@ inline double dispatch_once(const LoadedKernel &lk,
       .count();
 }
 
+// ---------------------------------------------------------------------------
+// Multi-dispatch chain (the C++ analogue of `xrt::runlist`, and of the Python
+// `HRXHostRuntime.run_chain`). Each entry is one kernel dispatch with its own
+// bindings; all are recorded, in order, into a single HRX command buffer.
+// HRX inserts an execution + memory barrier after every dispatch, so a later
+// run observes an earlier run's device writes (producer -> consumer chains
+// work, e.g. one run's output buffer is the next run's input). A single
+// `synchronize` then submits the whole batch as one execution -- the amdxdna
+// HAL lowers a multi-dispatch command buffer into one `ERT_CMD_CHAIN`. Entries
+// may share one LoadedKernel (re-dispatch the same kernel) or use different
+// ones (a true multi-kernel pipeline). Returns elapsed us for the whole chain.
+// ---------------------------------------------------------------------------
+struct ChainRun {
+  const LoadedKernel *lk;
+  std::vector<Buffer *> bindings;
+};
+
+inline double dispatch_chain(const std::vector<ChainRun> &runs) {
+  Context &ctx = Context::get();
+  hrx_dispatch_config_t cfg{};
+  cfg.workgroup_count[0] = cfg.workgroup_count[1] = cfg.workgroup_count[2] = 1;
+  cfg.workgroup_size[0] = cfg.workgroup_size[1] = cfg.workgroup_size[2] = 1;
+  cfg.subgroup_size = 0;
+
+  auto start = std::chrono::high_resolution_clock::now();
+  for (const auto &run : runs) {
+    // hrx_stream_dispatch copies the binding refs into the recorded command, so
+    // a per-iteration local is safe; the batch stays pending until synchronize.
+    std::vector<hrx_buffer_ref_t> refs(run.bindings.size());
+    for (size_t i = 0; i < run.bindings.size(); ++i) {
+      refs[i].buffer = run.bindings[i]->handle();
+      refs[i].offset = 0;
+      refs[i].length = run.bindings[i]->nbytes();
+    }
+    hrx_check(hrx_stream_dispatch(ctx.stream, run.lk->exe, run.lk->ordinal, &cfg,
+                                  nullptr, 0, refs.data(), refs.size(),
+                                  HRX_DISPATCH_FLAG_NONE),
+              "hrx_stream_dispatch");
+  }
+  hrx_check(hrx_stream_synchronize(ctx.stream), "hrx_stream_synchronize");
+  auto stop = std::chrono::high_resolution_clock::now();
+  return std::chrono::duration_cast<std::chrono::microseconds>(stop - start)
+      .count();
+}
+
 inline void report_timing(double total, double mn, double mx, int n_iters) {
   std::cout << std::endl
             << "Avg NPU time: " << (n_iters ? total / n_iters : 0.0) << "us."

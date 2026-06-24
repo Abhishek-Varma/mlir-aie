@@ -724,5 +724,24 @@ class HRXContext:
             "hrx_stream_dispatch",
         )
 
+    def dispatch_chain(self, items):
+        """Record a sequence of dispatches into one command buffer (no submit).
+
+        ``items`` is an iterable of ``(executable, export_ordinal, bindings)``,
+        where ``bindings`` is a list of ``(buffer_handle, size)`` (same shape
+        :meth:`dispatch` takes). This is the HRX analogue of an ``xrt::runlist``:
+        each :meth:`dispatch` records into the stream's pending command buffer,
+        and HRX inserts an execution + memory barrier after every dispatch, so a
+        later dispatch observes an earlier one's device writes (producer ->
+        consumer chains are correct). The whole batch stays pending until
+        :meth:`synchronize`, which submits it as a single execution — the
+        amdxdna HAL lowers a multi-dispatch command buffer into one
+        ``ERT_CMD_CHAIN`` issued/waited once.
+
+        Records only; call :meth:`synchronize` to submit and wait.
+        """
+        for exe, export_ordinal, bindings in items:
+            self.dispatch(exe, export_ordinal, bindings)
+
     def synchronize(self):
         _check(_hrx_stream_synchronize(self.stream), "hrx_stream_synchronize")
