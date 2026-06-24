@@ -37,7 +37,18 @@ except ImportError as e:
     )
     has_xrt = False
 
-if has_xrt:
+# Host-runtime backend selection. ``IRON_RUNTIME`` chooses between the XRT
+# (default) and HRX (libhrx amdxdna) host stacks. The HRX backend consumes the
+# identical aiecc artifacts (final.xclbin + insts.bin); only the dispatch path
+# differs. We import the HRX package lazily (only when selected) because it
+# dlopen()s libhrx + libironhrx_xadx at import time.
+_IRON_RUNTIME = os.environ.get("IRON_RUNTIME", "xrt").lower()
+
+if _IRON_RUNTIME == "hrx":
+    from .hostruntime.hrxruntime.tensor import HRXTensor
+
+    DEFAULT_TENSOR_CLASS = HRXTensor
+elif has_xrt:
     from .hostruntime.xrtruntime.tensor import XRTTensor
 
     DEFAULT_TENSOR_CLASS = XRTTensor
@@ -214,7 +225,13 @@ _DefaultNPURuntime = None
 
 def _get_default_npu_runtime():
     global _DefaultNPURuntime
-    if _DefaultNPURuntime is None and has_xrt:
+    if _DefaultNPURuntime is not None:
+        return _DefaultNPURuntime
+    if _IRON_RUNTIME == "hrx":
+        from .hostruntime.hrxruntime.hostruntime import CachedHRXRuntime
+
+        _DefaultNPURuntime = CachedHRXRuntime()
+    elif has_xrt:
         assert CachedXRTRuntime is not None
         _DefaultNPURuntime = CachedXRTRuntime()
     return _DefaultNPURuntime
