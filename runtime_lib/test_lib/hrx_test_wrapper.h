@@ -17,10 +17,11 @@
 // makes that header pull this one in instead, so no example source changes.
 //
 // It consumes the identical artifacts as the XRT path (`final.xclbin` +
-// `insts.bin`): the insts.bin TXN stream is converted to an aiebu control ELF
-// (via `aiebu-asm`), its `.ctrltext` becomes the XADX control code and its
-// `.rela.dyn` becomes the (offset, arg_idx, addend) patch table, and the two
-// are wrapped into an HRX "amdxdna-xclbin-fb" executable by the shared
+// `insts.bin`): the insts.bin TXN stream's words become the XADX control code
+// and its embedded DDR_PATCH ops are parsed directly into the (offset, arg_idx,
+// addend) patch table (no aiebu-asm; see parse_txn()). An aiebu control-ELF
+// round-trip remains as a fallback for ELF input / unknown TXN versions. The
+// two are wrapped into an HRX "amdxdna-xclbin-fb" executable by the shared
 // `libironhrx_xadx.so` helper. This is the C++ analogue of the Python
 // `HRXHostRuntime` (python/utils/hostruntime/hrxruntime/).
 //
@@ -50,6 +51,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -321,6 +323,134 @@ inline ControlProgram parse_control_elf(const std::vector<uint8_t> &d,
 }
 
 // ---------------------------------------------------------------------------
+// Direct TXN -> ControlProgram (no aiebu dependency). C++ port of parse_txn()
+// in python/utils/hostruntime/hrxruntime/__init__.py. Walks the raw insts.bin
+// op stream and derives the same (offset, arg_idx, addend) patch table aiebu
+// would emit; validated byte-for-byte against `aiebu-asm -t aie2txn`.
+//
+// Op layout from lib/Targets/AIETargetNPU.cpp + AIEToConfiguration.cpp:
+//   - 16-byte header: major=byte[0], minor=byte[1], num_ops@8, txn_size@12.
+//   - BLOCKWRITE (0x01): base@+8, opSize@+12, payload words from +16; payload
+//     word j programs absolute address base + 4*j.
+//   - DDR_PATCH (0x81): opSize@+4, addr@+24, argIdx@+32, argPlus@+40. argIdx is
+//     already the 0-based binding index. The reloc lands on the low DDR-address
+//     word, i.e. the TXN word at absolute address (addr - 4).
+// The .ctrltext aiebu emits is the raw TXN verbatim, so control_code = words.
+// ---------------------------------------------------------------------------
+struct TxnUnsupported : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+inline ControlProgram parse_txn(const std::vector<uint8_t> &d) {
+  constexpr uint8_t OP_WRITE = 0x00, OP_BLOCKWRITE = 0x01, OP_MASKWRITE = 0x03,
+                    OP_PREEMPT = 0x06, OP_TCT = 0x80, OP_DDR_PATCH = 0x81;
+  constexpr size_t HEADER = 16;
+
+  if (d.size() < HEADER)
+    throw TxnUnsupported("insts.bin too small for a TXN header");
+  auto r32 = [&](size_t o) -> uint32_t {
+    if (o + 4 > d.size())
+      throw TxnUnsupported("TXN truncated");
+    uint32_t v;
+    std::memcpy(&v, d.data() + o, 4);
+    return v;
+  };
+  auto ri32 = [&](size_t o) -> int32_t {
+    return static_cast<int32_t>(r32(o));
+  };
+
+  if (d[0] != 0 || d[1] != 1)
+    throw TxnUnsupported("unsupported TXN version (only 0.1 handled directly)");
+
+  // absolute AIE address -> byte offset of the word that programs it.
+  std::unordered_map<uint32_t, uint32_t> addr_to_off;
+  struct Patch {
+    uint32_t addr;
+    int32_t arg_idx;
+    int32_t addend;
+  };
+  std::vector<Patch> patches;
+
+  size_t i = HEADER;
+  while (i < d.size()) {
+    uint8_t opc = d[i];
+    size_t start = i;
+    if (opc == OP_WRITE) { // 24 bytes
+      addr_to_off[r32(i + 8)] = static_cast<uint32_t>(i + 16);
+      i += r32(i + 20);
+    } else if (opc == OP_BLOCKWRITE) {
+      uint32_t base = r32(i + 8);
+      uint32_t op_size = r32(i + 12);
+      if (op_size < 16)
+        throw TxnUnsupported("malformed BLOCKWRITE op size");
+      for (uint32_t j = 0; j < (op_size - 16) / 4; ++j)
+        addr_to_off[base + 4 * j] = static_cast<uint32_t>(i + 16 + 4 * j);
+      i += op_size;
+    } else if (opc == OP_MASKWRITE) { // 28 bytes
+      i += r32(i + 24);
+    } else if (opc == OP_TCT) {
+      i += r32(i + 4);
+    } else if (opc == OP_DDR_PATCH) {
+      uint32_t op_size = r32(i + 4);
+      if (op_size < 44)
+        throw TxnUnsupported("malformed DDR_PATCH op size");
+      patches.push_back({r32(i + 24), ri32(i + 32), ri32(i + 40)});
+      i += op_size;
+    } else if (opc == OP_PREEMPT) { // 8-byte TxnPreemptHeader
+      i += 8;
+    } else {
+      throw TxnUnsupported("unhandled TXN opcode " + std::to_string(opc));
+    }
+    if (i <= start)
+      throw TxnUnsupported("zero-size TXN op");
+  }
+
+  ControlProgram out;
+  out.control_code.resize(d.size() / 4);
+  std::memcpy(out.control_code.data(), d.data(),
+              out.control_code.size() * 4);
+
+  for (const auto &p : patches) {
+    auto it = addr_to_off.find(p.addr - 4);
+    if (it == addr_to_off.end())
+      throw TxnUnsupported("DDR_PATCH target has no preceding write");
+    if (p.arg_idx >= 0) {
+      out.patch_table.push_back(it->second);
+      out.patch_table.push_back(static_cast<uint32_t>(p.arg_idx));
+      out.patch_table.push_back(static_cast<uint32_t>(p.addend));
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Resolve a ControlProgram for an insts.bin / control ELF. Prefers the direct
+// TXN parser (no aiebu); falls back to the aiebu-asm round-trip for an already-
+// ELF input or a TXN version the direct parser doesn't know. Set
+// IRON_HRX_FORCE_AIEBU=1 to always use the aiebu path.
+// ---------------------------------------------------------------------------
+inline ControlProgram load_control_program(const std::string &insts_path) {
+  std::ifstream f(insts_path, std::ios::binary);
+  if (!f)
+    throw std::runtime_error("could not read insts: " + insts_path);
+  std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+
+  if (data.size() >= 4 && data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' &&
+      data[3] == 'F')
+    return parse_control_elf(data);
+
+  if (!std::getenv("IRON_HRX_FORCE_AIEBU")) {
+    try {
+      return parse_txn(data);
+    } catch (const TxnUnsupported &) {
+      // fall through to the aiebu round-trip
+    }
+  }
+  return parse_control_elf(insts_to_control_elf(insts_path));
+}
+
+// ---------------------------------------------------------------------------
 // Build + load an HRX executable from the artifacts, returning (exe, ordinal).
 // ---------------------------------------------------------------------------
 struct LoadedKernel {
@@ -338,8 +468,9 @@ inline LoadedKernel load_kernel(const std::string &xclbin_path,
   std::vector<uint8_t> xclbin((std::istreambuf_iterator<char>(xf)),
                               std::istreambuf_iterator<char>());
 
-  // insts.bin -> control ELF -> (control_code, patch_table).
-  ControlProgram cp = parse_control_elf(insts_to_control_elf(insts_path));
+  // insts.bin -> (control_code, patch_table). Direct TXN parse (no aiebu),
+  // with an aiebu-asm fallback for ELF input / unknown TXN versions.
+  ControlProgram cp = load_control_program(insts_path);
 
   // Serialize the XADX flatbuffer.
   uint8_t *blob = nullptr;

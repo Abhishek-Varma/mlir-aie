@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 
 from ..hostruntime import HostRuntime, HostRuntimeError, KernelHandle, KernelResult
 from .tensor import HRXTensor
-from . import HRXContext, HRXError, insts_to_control_elf, parse_control_elf
+from . import HRXContext, HRXError, control_code_and_patch_table
 
 if TYPE_CHECKING:
     from aie.iron.device import Device
@@ -109,13 +109,15 @@ class HRXHostRuntime(HostRuntime):
         xclbin_bytes = xclbin_path.read_bytes()
         # HRX needs the (offset, arg_idx, addend) patch table so it can host-patch
         # each I/O buffer's device address into the control code. The raw insts.bin
-        # carries the addresses only as embedded DDR_PATCH ops, so convert it to an
-        # aiebu control ELF and pull .ctrltext + .rela.dyn out of it (the same path
-        # the FastFlowLM interposer uses). Without the patch table the NPU writes to
-        # address 0 and the output is all zeros.
+        # carries the addresses only as embedded DDR_PATCH ops, so we extract the
+        # patch table from the TXN directly (no aiebu-asm), falling back to the
+        # aiebu control-ELF round-trip only for TXN versions the direct parser
+        # doesn't know. Without the patch table the NPU writes to address 0 and the
+        # output is all zeros.
         try:
-            elf_bytes = insts_to_control_elf(insts_path)
-            cc_words, patch_table = parse_control_elf(elf_bytes, scalar_args=3)
+            cc_words, patch_table = control_code_and_patch_table(
+                insts_path, scalar_args=3
+            )
             xadx = self._ctx.build_xadx(
                 xclbin_bytes, cc_words, kernel_name, patch_table=patch_table
             )

@@ -18,10 +18,13 @@ Library discovery order for ``libhrx.so``:
 """
 
 import ctypes
+import logging
 import os
 from pathlib import Path
 
 from .discovery import ensure_xadx_helper, find_libhrx
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Enum / flag constants (mirror hrx_runtime.h; values match IREE HAL).
@@ -256,6 +259,135 @@ def _check(status, what: str):
 
 
 # ---------------------------------------------------------------------------
+# Direct TXN -> (control_code, patch_table)   [no aiebu dependency]
+# ---------------------------------------------------------------------------
+class TxnUnsupportedError(HRXError):
+    """Raised when an insts.bin TXN stream can't be parsed directly.
+
+    Signals the caller to fall back to the aiebu-asm round-trip
+    (:func:`insts_to_control_elf` + :func:`parse_control_elf`).
+    """
+
+
+# XAie_TxnOpcode values (mlir-aie lib/Targets/AIETargetNPU.cpp).
+_TXN_OP_WRITE = 0x00
+_TXN_OP_BLOCKWRITE = 0x01
+_TXN_OP_MASKWRITE = 0x03
+_TXN_OP_PREEMPT = 0x06
+_TXN_OP_TCT = 0x80  # XAIE_IO_CUSTOM_OP_BEGIN
+_TXN_OP_DDR_PATCH = 0x81  # XAIE_IO_CUSTOM_OP_DDR_PATCH
+_TXN_HEADER_BYTES = 16
+
+
+def parse_txn(insts_bytes: bytes):
+    """Extract ``(control_code, patch_table)`` straight from a raw ``insts.bin``.
+
+    This removes the runtime dependency on ``aiebu-asm``: instead of converting
+    the TXN to an aiebu control ELF and reading its ``.rela.dyn`` (see
+    :func:`parse_control_elf`), it walks the TXN op stream itself and derives the
+    same patch table that aiebu would emit. Validated byte-for-byte against
+    ``aiebu-asm -t aie2txn`` output.
+
+    Background (op layout from ``AIETargetNPU.cpp`` / ``AIEToConfiguration.cpp``):
+
+      * The aiebu ``.ctrltext`` is the raw TXN bytes verbatim, so the **control
+        code is just the ``insts.bin`` words**.
+      * 16-byte header: ``major=byte[0]``, ``minor=byte[1]``, ``num_ops`` @ byte
+        8, ``txn_size`` @ byte 12. Only TXN v0.1 is currently emitted/handled.
+      * ``BLOCKWRITE`` (op 0x01): base addr @ +8, opSize @ +12, then a payload of
+        32-bit words starting @ +16; payload word ``j`` programs absolute address
+        ``base + 4*j``.
+      * ``DDR_PATCH`` (op 0x81): opSize @ +4, ``addr`` @ +24, ``argIdx`` @ +32,
+        ``argPlus`` @ +40. ``argIdx`` is already the 0-based buffer/binding index
+        (aiebu would turn it into the XRT arg index ``argIdx + 3``).
+
+    The relocation lands on the *low* word of the BD's 64-bit DDR address, i.e.
+    the TXN word at absolute address ``addr - 4``; its byte position in the
+    control code is the patch ``offset``.
+
+    Returns ``(control_code: np.uint32[], patch_table: np.uint32[] flat triples)``
+    identical in shape/meaning to :func:`parse_control_elf`.
+    Raises :class:`TxnUnsupportedError` on any unrecognized header/opcode.
+    """
+    import struct
+
+    import numpy as np
+
+    d = insts_bytes
+    if len(d) < _TXN_HEADER_BYTES:
+        raise TxnUnsupportedError("insts.bin too small for a TXN header")
+
+    def r32(o):
+        return struct.unpack_from("<I", d, o)[0]
+
+    def s32(o):
+        return struct.unpack_from("<i", d, o)[0]
+
+    major, minor = d[0], d[1]
+    if (major, minor) != (0, 1):
+        raise TxnUnsupportedError(
+            f"unsupported TXN version {major}.{minor} (only 0.1 handled directly)"
+        )
+
+    # Map absolute AIE address -> byte offset of the word that programs it, so a
+    # DDR_PATCH's target address resolves to a patch offset in the control code.
+    addr_to_off = {}
+    patches = []  # (target_addr, arg_idx, addend)
+
+    i = _TXN_HEADER_BYTES
+    try:
+        while i < len(d):
+            opc = d[i]
+            start = i
+            if opc == _TXN_OP_WRITE:  # 24 bytes
+                addr_lo = r32(i + 8)
+                addr_to_off[addr_lo] = i + 16
+                i += r32(i + 20)
+            elif opc == _TXN_OP_BLOCKWRITE:
+                base = r32(i + 8)
+                op_size = r32(i + 12)
+                if op_size < 16:
+                    raise TxnUnsupportedError("malformed BLOCKWRITE op size")
+                for j in range((op_size - 16) // 4):
+                    addr_to_off[base + 4 * j] = i + 16 + 4 * j
+                i += op_size
+            elif opc == _TXN_OP_MASKWRITE:  # 28 bytes
+                i += r32(i + 24)
+            elif opc == _TXN_OP_TCT:
+                i += r32(i + 4)
+            elif opc == _TXN_OP_DDR_PATCH:
+                op_size = r32(i + 4)
+                if op_size < 44:
+                    raise TxnUnsupportedError("malformed DDR_PATCH op size")
+                patches.append((r32(i + 24), s32(i + 32), s32(i + 40)))
+                i += op_size
+            elif opc == _TXN_OP_PREEMPT:  # 8-byte TxnPreemptHeader
+                i += 8
+            else:
+                raise TxnUnsupportedError(f"unhandled TXN opcode {hex(opc)} @ {i}")
+            if i <= start:
+                raise TxnUnsupportedError(f"zero-size TXN op {hex(opc)} @ {start}")
+    except struct.error as e:
+        raise TxnUnsupportedError(f"TXN truncated while parsing: {e}") from e
+
+    control_code = np.frombuffer(d, dtype=np.uint32).copy()
+
+    patch = []
+    for target_addr, arg_idx, addend in patches:
+        # The patch lands on the low DDR-address word, at absolute addr-4.
+        off = addr_to_off.get(target_addr - 4)
+        if off is None:
+            raise TxnUnsupportedError(
+                f"DDR_PATCH target {hex(target_addr)} has no preceding write "
+                f"(can't resolve patch offset)"
+            )
+        if arg_idx >= 0:
+            patch.extend((off, arg_idx, addend & 0xFFFFFFFF))
+    patch_table = np.asarray(patch, dtype=np.uint32)
+    return control_code, patch_table
+
+
+# ---------------------------------------------------------------------------
 # Control-ELF -> (control_code, patch_table)
 # ---------------------------------------------------------------------------
 def parse_control_elf(elf_bytes: bytes, scalar_args: int = 3):
@@ -387,6 +519,35 @@ def insts_to_control_elf(insts_path) -> bytes:
             f"{e.stderr.decode('utf-8', 'replace')}"
         ) from e
     return sibling.read_bytes()
+
+
+def control_code_and_patch_table(insts_path, scalar_args: int = 3):
+    """Resolve ``(control_code, patch_table)`` for an ``insts.bin`` / control ELF.
+
+    Strategy (avoids ``aiebu-asm`` whenever possible):
+      1. If the file is already an ELF, parse it with :func:`parse_control_elf`.
+      2. Otherwise parse the raw TXN directly with :func:`parse_txn` (no aiebu).
+      3. If direct parsing isn't supported (unknown TXN version/opcode), fall
+         back to the ``aiebu-asm`` round-trip
+         (:func:`insts_to_control_elf` + :func:`parse_control_elf`).
+
+    Set ``IRON_HRX_FORCE_AIEBU=1`` to always use the aiebu path (debugging /
+    bringing up a new TXN version before the direct parser learns it).
+    """
+    insts_path = Path(insts_path)
+    data = insts_path.read_bytes()
+
+    if data[:4] == b"\x7fELF":
+        return parse_control_elf(data, scalar_args=scalar_args)
+
+    if not os.environ.get("IRON_HRX_FORCE_AIEBU"):
+        try:
+            return parse_txn(data)
+        except TxnUnsupportedError as e:
+            logger.debug("direct TXN parse failed (%s); falling back to aiebu", e)
+
+    elf_bytes = insts_to_control_elf(insts_path)
+    return parse_control_elf(elf_bytes, scalar_args=scalar_args)
 
 
 class HRXContext:
