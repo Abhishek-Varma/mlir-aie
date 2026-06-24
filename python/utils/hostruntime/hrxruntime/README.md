@@ -183,6 +183,29 @@ Designs known to pass on HRX: `vector_scalar_mul`, `vector_vector_add`,
 `vector_scalar_add`, `vector_reduce_add`, `passthrough_dmas`,
 `vector_reduce_max`.
 
+### 5c. Multi-dispatch chains / runlists (`run_chain`)
+
+`HRXHostRuntime.run_chain([(handle, args), ...])` is the HRX analogue of
+`xrt::runlist` (the XRT `test_runlist.cpp` testbench): it records several
+dispatches into one HRX command buffer — in order, with an execution + memory
+barrier between them — and submits the whole batch with a single
+`synchronize`. The amdxdna HAL lowers the multi-dispatch command buffer into one
+`ERT_CMD_CHAIN`. Because of the barrier, a later run observes an earlier run's
+device writes, so producer→consumer chains work (one run's output buffer is the
+next run's input). Entries may share one `handle` (re-dispatch the same kernel)
+or use different handles (a true multi-kernel pipeline).
+
+A chained test mirroring `test_runlist.cpp` (`run0: out0 = in+1`,
+`run1: out1 = out0+1`, plus a deeper N-link chain):
+
+```bash
+cd programming_examples/basic/vector_scalar_add
+make all                              # build/final.xclbin + build/insts.bin
+IRON_RUNTIME=hrx python3 test_chain_hrx.py \
+  --xclbin build/final.xclbin --instr build/insts.bin --kernel MLIR_AIE
+# expect: PASS!
+```
+
 ---
 
 ## 6. Run C++ on-hardware tests with HRX
@@ -221,6 +244,33 @@ What `RUNTIME=hrx` does under the hood (no per-example edits):
 > libironhrx_xadx.so` at run time, you have a **stale exe** with an outdated
 > RPATH. Run `make clean` first, then `RUNTIME=hrx make run`. (A fresh checkout
 > has no stale artifacts, so this only bites when reusing a build tree.)
+
+### 6b. C++ multi-dispatch chains / runlists
+
+`hrx_test::dispatch_chain({{&lk, {&a, &b}}, ...})` (in `hrx_test_wrapper.h`) is
+the C++ analogue of `xrt::runlist` (the XRT `test_runlist.cpp` testbench) and of
+the Python `run_chain`: it records several kernel dispatches into one HRX command
+buffer — in order, with an execution + memory barrier between them — then submits
+the batch with a single `synchronize` (the amdxdna HAL lowers it into one
+`ERT_CMD_CHAIN`). A later run sees an earlier run's device writes, so
+producer→consumer chains work; entries may share one `LoadedKernel` or use
+different ones (a multi-kernel pipeline).
+
+A chained testbench mirroring `test_runlist.cpp` (`run0: out0 = in+1`,
+`run1: out1 = out0+1`, where `run1`'s input is `run0`'s output) lives in
+`vector_scalar_add`. Its make target self-selects the HRX backend
+(`-DUSE_HRX=ON`), so you don't even need `RUNTIME=hrx`:
+
+```bash
+cd programming_examples/basic/vector_scalar_add
+make all                       # build/final.xclbin + build/insts.bin
+make run_runlist_hrx           # build the HRX chain testbench + run on the NPU
+# expect: ... PASS!
+```
+
+> The HRX runlist testbench reads `insts.bin` directly (the wrapper parses the
+> TXN itself — no aiebu/ELF needed), unlike the XRT `run_runlist` target which
+> consumes `insts.elf`.
 
 ---
 
