@@ -25,12 +25,15 @@ capability probe in ``aie.utils`` (which only imports the sibling
 import ctypes
 import logging
 import os
+import platform
 import struct
 import threading
 
 import numpy as np
 
 from .discovery import find_libhrx
+
+_IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +157,40 @@ _handle = ctypes.c_void_p
 def _load_libhrx() -> ctypes.CDLL:
     last_err = None
     tried = []
+
+    if _IS_WINDOWS:
+        # Windows has no RTLD_GLOBAL, and DLL dependency resolution is driven by
+        # the loader's search path -- not PATH alone -- so register the library's
+        # own directory (and any LIBHRX_DIR hint) with os.add_dll_directory so
+        # hrx.dll's sibling dependencies resolve, then load it by full path.
+        libhrx_dir = os.environ.get("LIBHRX_DIR")
+        if libhrx_dir and os.path.isdir(libhrx_dir):
+            try:
+                os.add_dll_directory(libhrx_dir)
+            except OSError:
+                pass
+        found = find_libhrx()
+        # Auto-detected full path first, then bare names via the default search.
+        for c in [found, "hrx.dll", "libhrx.dll"]:
+            if not c:
+                continue
+            tried.append(c)
+            dll_dir = os.path.dirname(c)
+            if dll_dir and os.path.isdir(dll_dir):
+                try:
+                    os.add_dll_directory(dll_dir)
+                except OSError:
+                    pass
+            try:
+                return ctypes.CDLL(c)
+            except OSError as e:
+                last_err = e
+        raise HRXError(
+            f"Could not load hrx.dll (tried: {tried}). Install HRX or set "
+            f"HRX_DIR/LIBHRX_DIR/HRX_LIBHRX to the release that contains "
+            f"bin\\hrx.dll. Last error: {last_err}"
+        )
+
     # Auto-detected path first (env hints + standard locations), then a bare
     # name so the dynamic loader's LD_LIBRARY_PATH search still works.
     for c in [find_libhrx(), "libhrx.so"]:
