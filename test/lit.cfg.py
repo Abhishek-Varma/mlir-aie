@@ -225,6 +225,31 @@ if config.has_mlir_runtime_libraries:
 if config.pytorch:
     config.available_features.add("pytorch")
 
+# Per-backend, per-RUN-line device runners for the runtime-agnostic on-device
+# Python tests (test/python/npu). lit's REQUIRES is file-level, but those tests
+# carry both XRT and HRX RUN lines, and the two backends run on separate CI
+# runners with mutually exclusive Python bindings (the pure-HRX runner has no
+# pyxrt). So gate each RUN line via a dedicated substitution instead:
+#   * %run_on_npu1_xrt% / %run_on_npu2_xrt% -> the device wrapper only when
+#     pyxrt is importable, else a no-op "echo" (so the XRT lines skip cleanly on
+#     an XRT-free HRX host rather than dispatching CPU tensors on the NPU);
+#   * %run_on_npu2_hrx% -> the npu2 wrapper prefixed with NPU_RUNTIME=hrx, only
+#     when libhrx is locatable, else a no-op "echo".
+# Device presence is already baked into %run_on_npu{1,2}% (they are "echo" when
+# the matching NPU is absent), so these compose device + binding gating.
+_xrt_ok = "xrt_python_bindings" in config.available_features
+_hrx_ok = "hrx_python_bindings" in config.available_features
+_run_on_npu1 = xrt_config.substitutions.get("%run_on_npu1%", "echo")
+_run_on_npu2 = xrt_config.substitutions.get("%run_on_npu2%", "echo")
+config.substitutions.append(("%run_on_npu1_xrt%", _run_on_npu1 if _xrt_ok else "echo"))
+config.substitutions.append(("%run_on_npu2_xrt%", _run_on_npu2 if _xrt_ok else "echo"))
+config.substitutions.append(
+    (
+        "%run_on_npu2_hrx%",
+        (_run_on_npu2 + " env NPU_RUNTIME=hrx") if _hrx_ok else "echo",
+    )
+)
+
 if "LIT_AVAILABLE_FEATURES" in os.environ:
     for feature in os.environ["LIT_AVAILABLE_FEATURES"].split():
         config.available_features.add(feature)
